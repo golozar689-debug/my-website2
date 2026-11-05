@@ -4,6 +4,7 @@ import { AuthDialog, AccountDialog, ModalShell } from './components/AccountDialo
 import { api } from './lib/api.js';
 
 const GlassScene = lazy(() => import('./components/GlassScene.jsx'));
+const AdminDashboard = lazy(() => import('./components/AdminDashboard.jsx'));
 
 const fa = value => new Intl.NumberFormat('fa-IR', { useGrouping: false }).format(value);
 const dateFormat = (value, options = {}) => new Intl.DateTimeFormat('fa-IR', { timeZone: 'Asia/Tehran', ...options }).format(new Date(`${value}T12:00:00+03:30`));
@@ -26,6 +27,13 @@ const VISITS = [
 ];
 
 function App() {
+  if (window.location.pathname.replace(/\/+$/, '') === '/admin') {
+    return <Suspense fallback={<div className="app-loading" role="status"><LoaderCircle className="spin" size={24} />در حال آماده‌سازی پنل مدیریت…</div>}><AdminDashboard /></Suspense>;
+  }
+  return <HomePage />;
+}
+
+function HomePage() {
   const [user, setUser] = useState(null);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [authMode, setAuthMode] = useState(null);
@@ -136,7 +144,8 @@ function App() {
       <section className="faq-section container section"><div className="faq-intro"><span className="eyebrow"><span className="tiny-plus">+</span> پیش از مراجعه</span><h2>شاید سؤال شما<br />هم همین باشد.</h2><p>پاسخ‌های کوتاه، برای یک شروع آرام‌تر.</p><span className="faq-spark">✳</span></div><div className="faq-list">{[
         ['چطور نوبت بگیرم؟','در بخش نوبت‌دهی، روز و ساعت را انتخاب کنید، وارد حساب شوید و شماره همراه خود را وارد کنید. پس از ثبت، درخواست در بخش «نوبت‌های من» قابل مشاهده است. تأیید نهایی زمان مراجعه باید توسط مطب انجام شود.'],
         ['آیا زمان‌های نمایش‌داده‌شده برنامه قطعی مطب هستند؟','خیر. در این نسخه، ساعت‌ها برای نمایش عملکرد سامانه تنظیم شده‌اند. برنامه حضور، آدرس و راه ارتباطی باید پیش از استفاده عمومی توسط مطب تأیید و تکمیل شوند.'],
-        ['چطور نوبت خودم را لغو کنم؟','پس از ورود، روی نام خود در بالای صفحه بزنید. در بخش «نوبت‌های من» درخواست موردنظر را پیدا و گزینه لغو را انتخاب کنید.'],
+        ['چطور وضعیت نوبت را ببینم یا آن را لغو کنم؟','پس از ورود، روی نام خود در بالای صفحه بزنید. در بخش «نوبت‌های من» وضعیت درخواست را ببینید. تأیید مدیر سایت در همین بخش نمایش داده می‌شود. برای لغو، درخواست موردنظر را پیدا و گزینه لغو را انتخاب کنید.'],
+        ['چه کسی به اطلاعات حساب و نوبت‌ها دسترسی دارد؟','مدیر سایت برای مدیریت خدمات به نام، ایمیل، اطلاعات نوبت و شماره همراه ثبت‌شده دسترسی دارد. رمز عبور به‌صورت هش ذخیره می‌شود و قابل مشاهده نیست. نظرهای منتشرشده با نام حساب شما برای بازدیدکنندگان نمایش داده می‌شوند.'],
         ['برای مراجعه چه چیزهایی همراه داشته باشم؟','سوابق دامپزشکی حیوان، نتایج آزمایش یا تصویربرداری قبلی و فهرست داروهای مصرفی او را آماده کنید. برای شرایط ویژه، راهنمایی اختصاصی را از مرکز دامپزشکی دریافت کنید.'],
       ].map(([q,a],i)=><div className={`faq-item ${faqOpen===i?'expanded':''}`} key={q}><button onClick={()=>setFaqOpen(faqOpen===i?null:i)} aria-expanded={faqOpen===i} aria-controls={`faq-${i}`}><span><small>{fa(i+1).padStart(2,'۰')}</small>{q}</span><Plus size={20} /></button><div id={`faq-${i}`} hidden={faqOpen!==i}><p>{a}</p></div></div>)}</div></section>
 

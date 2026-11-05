@@ -56,7 +56,7 @@ export function ModalShell({ children, onClose, title, className = '' }) {
   );
 }
 
-export function AuthDialog({ mode = 'login', onClose, onModeChange, onAuthenticated }) {
+export function AuthDialog({ mode = 'login', onClose, onModeChange, onAuthenticated, allowRegistration = true }) {
   const register = mode === 'register';
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -107,7 +107,7 @@ export function AuthDialog({ mode = 'login', onClose, onModeChange, onAuthentica
         {error && <p role="alert" className="form-error">{error}</p>}
         <button type="submit" className="primary-btn" disabled={busy}>{busy ? <LoaderCircle className="spin" size={19} /> : <ArrowLeft size={19} />}{busy ? 'لطفاً کمی صبر کنید…' : register ? 'ساخت حساب کاربری' : 'ورود به حساب'}</button>
       </form>
-      <p className="auth-switch">{register ? 'قبلاً حساب ساخته‌اید؟' : 'هنوز حساب ندارید؟'} <button type="button" onClick={() => onModeChange(register ? 'login' : 'register')} disabled={busy}>{register ? 'وارد شوید' : 'ثبت‌نام کنید'}</button></p>
+      {allowRegistration && <p className="auth-switch">{register ? 'قبلاً حساب ساخته‌اید؟' : 'هنوز حساب ندارید؟'} <button type="button" onClick={() => onModeChange(register ? 'login' : 'register')} disabled={busy}>{register ? 'وارد شوید' : 'ثبت‌نام کنید'}</button></p>}
       <div className="auth-note"><ShieldCheck size={16} /><span>اطلاعات حساب شما به‌صورت امن نگهداری می‌شود.</span></div>
     </ModalShell>
   );
@@ -161,16 +161,17 @@ export function AccountDialog({ user, onClose, onLogout, onChanged }) {
     <ModalShell onClose={onClose} title="فضای شخصی شما" className="account-dialog">
       <p className="eyebrow">حساب کاربری</p>
       <div className="account-welcome"><div className="account-avatar"><UserRound size={25} /></div><div><strong>سلام، {user.name}</strong><p dir="ltr">{user.email}</p></div></div>
+      {user.role === 'admin' && <a className="secondary-btn account-admin-link" href="/admin"><ShieldCheck size={18} />ورود به پنل مدیریت سایت<ArrowLeft size={17} /></a>}
       <div className="account-section-title"><h3>نوبت‌های من</h3><CalendarDays size={20} /></div>
       {loading ? <div className="account-loading" role="status"><LoaderCircle size={22} className="spin" /><span>در حال دریافت نوبت‌ها…</span></div> : appointments.length === 0 ? <div className="account-empty"><CalendarDays size={32} /><h4>هنوز نوبتی ثبت نکرده‌اید</h4><p>از بخش نوبت‌دهی، زمان مناسب خود را انتخاب کنید.</p><button type="button" className="secondary-btn" onClick={onClose}>انتخاب نوبت <ArrowLeft size={16} /></button></div> : <div className="appointment-list">
         {appointments.map((appointment) => <article className="appointment-item" key={appointment.id}>
-          <div className="appointment-item-header"><strong>{appointmentNames[appointment.type] || 'درخواست نوبت'}</strong><span className={`appointment-status ${appointment.status === 'cancelled' ? 'cancelled' : ''}`}>{appointment.status === 'cancelled' ? 'لغو شده' : 'در انتظار تأیید مطب'}</span></div>
+          <div className="appointment-item-header"><strong>{appointmentNames[appointment.type] || 'درخواست نوبت'}</strong><span className={`appointment-status ${appointment.status === 'cancelled' ? 'cancelled' : appointment.status === 'confirmed' ? 'confirmed' : ''}`}>{appointment.status === 'cancelled' ? 'لغو شده' : appointment.status === 'confirmed' ? 'تأیید شده' : 'در انتظار تأیید مطب'}</span></div>
           <div className="appointment-details"><span><CalendarDays size={15} />{formattedDate(appointment.date)}</span><span><Clock3 size={15} />ساعت {persianTime(appointment.time)}</span></div>
           {appointment.status !== 'cancelled' && (confirming === appointment.id ? <div className="cancel-confirmation"><span>این درخواست نوبت لغو شود؟</span><button type="button" className="cancel-yes" onClick={() => cancel(appointment.id)} disabled={busy !== null}>{busy === appointment.id ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} بله، لغو شود</button><button type="button" onClick={() => setConfirming(null)} disabled={busy !== null}>انصراف</button></div> : <button type="button" className="cancel-appointment" onClick={() => setConfirming(appointment.id)} disabled={busy !== null}><Trash2 size={14} />لغو درخواست</button>)}
         </article>)}
       </div>}
       {error && <p className="form-error" role="alert">{error}</p>}
-      <p className="account-schedule-note">زمان‌های ارائه‌شده، برنامه نمونه سایت هستند. درخواست شما برای قطعی شدن به تأیید مطب نیاز دارد.</p>
+      <p className="account-schedule-note">زمان‌های ارائه‌شده، برنامه نمونه سایت هستند. وضعیت تأیید هر درخواست در کنار آن نمایش داده می‌شود؛ برای مراجعه با مرکز دامپزشکی هماهنگ کنید.</p>
       <button type="button" className="secondary-btn logout-btn" onClick={logout} disabled={busy !== null}>{busy === 'logout' ? <LoaderCircle className="spin" size={18} /> : <LogOut size={18} />}خروج از حساب</button>
     </ModalShell>
   );

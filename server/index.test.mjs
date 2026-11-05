@@ -9,7 +9,7 @@ import { createApp } from './index.mjs';
 const fixedNow = new Date('2026-11-05T08:00:00Z');
 
 async function fixture(t, options = {}) {
-  const app = createApp({ dbPath: ':memory:', now: () => fixedNow, ...options });
+  const app = createApp({ dbPath: ':memory:', now: () => fixedNow, adminEmail: undefined, adminPassword: undefined, ...options });
   app.server.listen(0, '127.0.0.1');
   await once(app.server, 'listening');
   t.after(() => app.server.listening
@@ -39,7 +39,7 @@ test('account lifecycle stores hashed credentials, uses private sessions and inv
   assert.deepEqual((await request('/api/session')).body, { user: null });
   const account = await register();
   assert.equal(account.body.user.name, 'کاربر آزمایشی');
-  assert.deepEqual(Object.keys(account.body.user).sort(), ['email', 'id', 'name']);
+  assert.deepEqual(Object.keys(account.body.user).sort(), ['email', 'id', 'name', 'role']);
   assert.match(account.response.headers.get('set-cookie'), /HttpOnly/);
   assert.match(account.response.headers.get('set-cookie'), /SameSite=Lax/);
   const stored = db.prepare('SELECT password_hash, password_salt FROM users').get();
@@ -251,4 +251,227 @@ test('production static server cannot escape the build directory through symlink
   assert.equal((await fetch(base + '/escape.txt')).status, 404);
   assert.equal((await fetch(base + '/escape-dir/private.txt')).status, 404);
   assert.equal((await fetch(base + '/%00')).status, 400);
+});
+
+const ownerCredentials = { adminEmail: 'owner@example.com', adminPassword: 'owner-bootstrap-secret-42' };
+async function adminFixture(t, options = {}) {
+  const app = await fixture(t, { ...ownerCredentials, ...options });
+  const login = await app.request('/api/auth/login', {
+    body: { email: options.adminEmail || ownerCredentials.adminEmail, password: options.adminPassword || ownerCredentials.adminPassword },
+  });
+  assert.equal(login.response.status, 200);
+  assert.equal(login.body.user.role, 'admin');
+  return { ...app, adminCookie: login.cookie, owner: login.body.user };
+}
+
+test('administration requires paired server credentials and ignores client-supplied roles', async t => {
+  for (const config of [{}, { adminEmail: ownerCredentials.adminEmail }, { adminPassword: ownerCredentials.adminPassword }]) {
+    const app = await fixture(t, config);
+    const forged = await app.request('/api/auth/register', {
+      body: { name: 'مدیر ادعایی', email: ownerCredentials.adminEmail, password: 'ordinary-register-pass', role: 'admin', blocked: false },
+    });
+    assert.equal(forged.response.status, 201);
+    assert.equal(forged.body.user.role, 'user');
+    assert.equal(app.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n, 0);
+    assert.equal((await app.request('/api/admin/overview', { cookie: forged.cookie })).response.status, 403);
+  }
+  assert.throws(() => createApp({ dbPath: ':memory:', adminEmail: 'invalid', adminPassword: ownerCredentials.adminPassword }), /ADMIN_EMAIL/);
+  assert.throws(() => createApp({ dbPath: ':memory:', adminEmail: ownerCredentials.adminEmail, adminPassword: 'short' }), /ADMIN_PASSWORD/);
+});
+
+test('every administration endpoint enforces role authorization before reading or changing data', async t => {
+  const { request, register } = await adminFixture(t);
+  const regular = await register();
+  const routes = [
+    ['/api/admin/overview'], ['/api/admin/users'], ['/api/admin/appointments'], ['/api/admin/reviews'], ['/api/admin/audit'],
+    ['/api/admin/users/1', 'PATCH', { blocked: true }],
+    ['/api/admin/appointments/1', 'PATCH', { status: 'confirmed' }],
+    ['/api/admin/appointments/1', 'DELETE'], ['/api/admin/reviews/1', 'PATCH', { hidden: true }],
+  ];
+  for (const [path, method = 'GET', body] of routes) {
+    assert.equal((await request(path, { method, body })).response.status, 401, path);
+    assert.equal((await request(path, { method, body, cookie: regular.cookie })).response.status, 403, path);
+  }
+});
+
+test('owner bootstrap protects stored credentials and preserves sessions only for unchanged configuration', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'vet-owner-bootstrap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'site.sqlite');
+  const first = await fixture(t, { dbPath });
+  const ordinary = await first.register(ownerCredentials.adminEmail);
+  assert.equal(ordinary.body.user.role, 'user');
+  const ownerId = ordinary.body.user.id;
+  await new Promise(resolve => first.server.close(resolve));
+  const provisioned = await adminFixture(t, { dbPath });
+  assert.equal(provisioned.owner.id, ownerId);
+  assert.equal((await provisioned.request('/api/session', { cookie: ordinary.cookie })).body.user, null);
+  const stored = provisioned.db.prepare('SELECT * FROM users WHERE id=?').get(ownerId);
+  assert.equal(stored.role, 'admin');
+  assert.equal(stored.password_hash.length, 128);
+  assert.notEqual(stored.password_hash, ownerCredentials.adminPassword);
+  assert.equal((await provisioned.request('/api/auth/login', {
+    body: { email: ownerCredentials.adminEmail, password: 'correct-horse-42' },
+  })).response.status, 401);
+  const cookie = provisioned.adminCookie;
+  await new Promise(resolve => provisioned.server.close(resolve));
+  const unchanged = await fixture(t, { dbPath, ...ownerCredentials });
+  assert.equal((await unchanged.request('/api/admin/overview', { cookie })).response.status, 200);
+  await new Promise(resolve => unchanged.server.close(resolve));
+  const rotated = await adminFixture(t, { dbPath, adminPassword: 'rotated-owner-password-99' });
+  assert.equal((await rotated.request('/api/session', { cookie })).body.user, null);
+  assert.equal((await rotated.request('/api/auth/login', {
+    body: { email: ownerCredentials.adminEmail, password: ownerCredentials.adminPassword },
+  })).response.status, 401);
+});
+
+test('changing the configured owner demotes previous administrators and revokes old and promoted sessions', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'vet-owner-rotation-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'site.sqlite');
+  const old = await adminFixture(t, { dbPath });
+  const replacement = await old.register('replacement@example.com');
+  const oldCookie = old.adminCookie;
+  const beforeTransfer = {
+    roles: old.db.prepare('SELECT id,role FROM users ORDER BY id').all().map(row => ({ ...row })),
+    sessions: old.db.prepare('SELECT token_hash,user_id FROM sessions ORDER BY token_hash').all().map(row => ({ ...row })),
+    audit: old.db.prepare('SELECT COUNT(*) AS n FROM admin_audit').get().n,
+  };
+  await new Promise(resolve => old.server.close(resolve));
+  assert.throws(() => createApp({ dbPath, now: () => fixedNow,
+    adminEmail: 'replacement@example.com', adminPassword: ownerCredentials.adminPassword,
+  }), { message: 'Changing ADMIN_EMAIL requires a new ADMIN_PASSWORD.' });
+  const unchanged = await fixture(t, { dbPath });
+  assert.deepEqual(unchanged.db.prepare('SELECT id,role FROM users ORDER BY id').all().map(row => ({ ...row })), beforeTransfer.roles);
+  assert.deepEqual(unchanged.db.prepare('SELECT token_hash,user_id FROM sessions ORDER BY token_hash').all().map(row => ({ ...row })), beforeTransfer.sessions);
+  assert.equal(unchanged.db.prepare('SELECT COUNT(*) AS n FROM admin_audit').get().n, beforeTransfer.audit);
+  assert.equal((await unchanged.request('/api/admin/overview', { cookie: oldCookie })).response.status, 200);
+  assert.equal((await unchanged.request('/api/session', { cookie: replacement.cookie })).body.user.role, 'user');
+  await new Promise(resolve => unchanged.server.close(resolve));
+  const next = await adminFixture(t, { dbPath, adminEmail: 'replacement@example.com', adminPassword: 'replacement-owner-secret-77' });
+  assert.equal(next.owner.id, replacement.body.user.id);
+  assert.equal(next.db.prepare('SELECT role FROM users WHERE id=?').get(old.owner.id).role, 'user');
+  assert.equal((await next.request('/api/session', { cookie: oldCookie })).body.user, null);
+  assert.equal((await next.request('/api/session', { cookie: replacement.cookie })).body.user, null);
+  const formerLogin = await next.request('/api/auth/login', {
+    body: { email: ownerCredentials.adminEmail, password: ownerCredentials.adminPassword },
+  });
+  assert.equal(formerLogin.body.user.role, 'user');
+  assert.equal((await next.request('/api/admin/users', { cookie: formerLogin.cookie })).response.status, 403);
+  assert.equal(next.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n, 1);
+});
+
+test('administrator can search and paginate accounts, block access and invalidate sessions', async t => {
+  const { request, register, db, adminCookie, owner } = await adminFixture(t);
+  const person = await register('managed@example.com');
+  const stored = db.prepare('SELECT password_hash,password_salt FROM users WHERE id=?').get(person.body.user.id);
+  const seed = db.prepare('INSERT INTO users (name,email,password_hash,password_salt,created_at) VALUES (?,?,?,?,?)');
+  for (let i = 0; i < 22; i++) seed.run(`کاربر ${i}`, `page${i}@example.com`, stored.password_hash, stored.password_salt, fixedNow.toISOString());
+  const page1 = await request('/api/admin/users', { cookie: adminCookie });
+  assert.equal(page1.body.total, 24);
+  assert.equal(page1.body.pageSize, 20);
+  assert.equal(page1.body.users.length, 20);
+  const page2 = await request('/api/admin/users?page=2', { cookie: adminCookie });
+  assert.equal(page2.body.users.length, 4);
+  const search = await request('/api/admin/users?q=MANAGED', { cookie: adminCookie });
+  assert.equal(search.body.total, 1);
+  assert.deepEqual(Object.keys(search.body.users[0]).sort(), ['appointmentCount','blocked','createdAt','email','id','name','reviewCount','role']);
+  for (const query of ['?page=0','?page=-1','?page=1.2','?page=1000001','?q=' + 'x'.repeat(201)]) {
+    assert.equal((await request('/api/admin/users' + query, { cookie: adminCookie })).response.status, 400, query);
+  }
+  assert.equal((await request(`/api/admin/users/${owner.id}`, { method: 'PATCH', body: { blocked: true }, cookie: adminCookie })).response.status, 400);
+  assert.equal((await request(`/api/admin/users/${person.body.user.id}`, { method: 'PATCH', body: { blocked: 'yes' }, cookie: adminCookie })).response.status, 400);
+  const block = await request(`/api/admin/users/${person.body.user.id}`, { method: 'PATCH', body: { blocked: true }, cookie: adminCookie });
+  assert.equal(block.response.status, 200);
+  assert.equal((await request('/api/session', { cookie: person.cookie })).body.user, null);
+  assert.equal((await request('/api/appointments', { cookie: person.cookie })).response.status, 401);
+  assert.equal((await request('/api/auth/login', { body: { email: 'managed@example.com', password: 'correct-horse-42' } })).response.status, 403);
+  assert.equal((await request('/api/auth/login', { body: { email: 'managed@example.com', password: 'wrong-password-99' } })).response.status, 401);
+  assert.equal((await request(`/api/admin/users/${person.body.user.id}`, { method: 'PATCH', body: { blocked: false }, cookie: adminCookie })).response.status, 200);
+  assert.equal((await request('/api/session', { cookie: person.cookie })).body.user, null);
+  assert.equal((await request('/api/auth/login', { body: { email: 'managed@example.com', password: 'correct-horse-42' } })).response.status, 200);
+});
+
+test('administrator confirms and cancels bookings while preserving ownership and availability rules', async t => {
+  const { request, register, adminCookie } = await adminFixture(t);
+  const person = await register();
+  const booking = await request('/api/appointments', { cookie: person.cookie,
+    body: { date: '2026-11-07', time: '16:00', type: 'consultation', phone: '09123456789' } });
+  const id = booking.body.appointment.id;
+  const pending = await request('/api/admin/appointments?status=pending', { cookie: adminCookie });
+  assert.equal(pending.body.total, 1);
+  assert.equal(pending.body.appointments[0].userEmail, 'user@example.com');
+  assert.equal(pending.body.appointments[0].phone, '09123456789');
+  const confirm = await request(`/api/admin/appointments/${id}`, { method: 'PATCH', cookie: adminCookie, body: { status: 'confirmed' } });
+  assert.equal(confirm.body.appointment.status, 'confirmed');
+  assert.equal((await request('/api/appointments', { cookie: person.cookie })).body.appointments[0].status, 'confirmed');
+  assert.equal((await request('/api/admin/appointments?status=confirmed', { cookie: adminCookie })).body.total, 1);
+  assert.equal((await request('/api/admin/appointments?status=pending', { cookie: adminCookie })).body.total, 0);
+  assert.equal((await request('/api/availability?date=2026-11-07')).body.slots[0].available, false);
+  for (const url of ['/api/admin/appointments?status=cancelled', '/api/admin/appointments?page=no']) {
+    assert.equal((await request(url, { cookie: adminCookie })).response.status, 400);
+  }
+  assert.equal((await request(`/api/admin/appointments/${id}`, { method: 'PATCH', cookie: adminCookie, body: { status: 'cancelled' } })).response.status, 400);
+  assert.equal((await request(`/api/admin/appointments/${id}`, { method: 'DELETE', cookie: adminCookie })).response.status, 200);
+  assert.equal((await request('/api/availability?date=2026-11-07')).body.slots[0].available, true);
+  assert.equal((await request('/api/appointments', { cookie: person.cookie })).body.appointments.length, 0);
+  for (const target of ['0','not-an-id','999999999999999999999999']) {
+    assert.equal((await request(`/api/admin/appointments/${target}`, { method: 'DELETE', cookie: adminCookie })).response.status, 404);
+  }
+});
+
+test('review moderation is reversible, private and audited along with protected owner actions', async t => {
+  const { request, register, adminCookie } = await adminFixture(t);
+  const person = await register();
+  const review = await request('/api/reviews', { cookie: person.cookie, body: { rating: 4, comment: 'تجربه آزمایشی کاربر برای بررسی مدیریت نظرها' } });
+  const id = review.body.review.id;
+  const adminReviews = await request('/api/admin/reviews', { cookie: adminCookie });
+  assert.equal(adminReviews.body.reviews[0].userId, person.body.user.id);
+  assert.equal(adminReviews.body.reviews[0].hidden, false);
+  assert.equal((await request(`/api/admin/reviews/${id}`, { method: 'PATCH', cookie: adminCookie, body: { hidden: true } })).response.status, 200);
+  assert.equal((await request('/api/reviews')).body.reviews.length, 0);
+  assert.equal((await request('/api/admin/reviews', { cookie: adminCookie })).body.reviews[0].hidden, true);
+  assert.equal((await request(`/api/admin/reviews/${id}`, { method: 'PATCH', cookie: adminCookie, body: { hidden: false } })).response.status, 200);
+  assert.equal((await request('/api/reviews')).body.reviews.length, 1);
+  const crossOrigin = await request(`/api/admin/reviews/${id}`, {
+    method: 'PATCH', cookie: adminCookie, body: { hidden: true }, headers: { Origin: 'https://attacker.invalid' },
+  });
+  assert.equal(crossOrigin.response.status, 403);
+  assert.equal((await request('/api/reviews')).body.reviews.length, 1);
+  const audit = await request('/api/admin/audit', { cookie: adminCookie });
+  assert.deepEqual(audit.body.entries.map(e => e.action), ['review.published','review.hidden','admin.provisioned']);
+  assert.deepEqual(Object.keys(audit.body.entries[0]).sort(), ['action','actorName','createdAt','id','targetId','targetType']);
+  for (const path of ['/api/admin/overview','/api/admin/users','/api/admin/appointments','/api/admin/reviews','/api/admin/audit']) {
+    const body = (await request(path, { cookie: adminCookie })).body;
+    const serialized = JSON.stringify(body);
+    assert.doesNotMatch(serialized, /password|salt|token_hash|password_hash/);
+    assert.ok(!serialized.includes(ownerCredentials.adminPassword));
+  }
+  const overview = await request('/api/admin/overview', { cookie: adminCookie });
+  assert.deepEqual(overview.body.stats, { users: 2, appointments: 0, reviews: 1, pending: 0, confirmed: 0 });
+});
+
+test('additive database migration preserves legacy accounts, bookings and reviews', async t => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const { scryptSync } = await import('node:crypto');
+  const dir = mkdtempSync(join(tmpdir(), 'vet-legacy-migration-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'legacy.sqlite');
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,password_salt TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE appointments (id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),date TEXT NOT NULL,time TEXT NOT NULL,type TEXT NOT NULL,phone TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(date,time));
+    CREATE TABLE reviews (id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),rating INTEGER NOT NULL,comment TEXT NOT NULL,created_at TEXT NOT NULL);`);
+  legacy.prepare('INSERT INTO users VALUES (1,?,?,?,?,?)').run('کاربر قدیمی','legacy@example.com',scryptSync('legacy-password-77','legacy-salt',64).toString('hex'),'legacy-salt',fixedNow.toISOString());
+  legacy.prepare('INSERT INTO appointments VALUES (1,1,?,?,?,?,?)').run('2026-11-07','17:30','followup','09123456789',fixedNow.toISOString());
+  legacy.prepare('INSERT INTO reviews VALUES (1,1,?,?,?)').run(5,'نظر قدیمی که باید حفظ شود',fixedNow.toISOString());
+  legacy.close();
+  const { request, db } = await fixture(t, { dbPath });
+  const login = await request('/api/auth/login', { body: { email:'legacy@example.com', password:'legacy-password-77' } });
+  assert.equal(login.response.status, 200);
+  assert.equal(login.body.user.role, 'user');
+  const appointments = await request('/api/appointments', { cookie:login.cookie });
+  assert.equal(appointments.body.appointments[0].status, 'pending');
+  assert.equal(appointments.body.appointments[0].time, '17:30');
+  assert.equal((await request('/api/reviews')).body.reviews[0].comment, 'نظر قدیمی که باید حفظ شود');
+  assert.equal(db.prepare('SELECT blocked FROM users WHERE id=1').get().blocked,0);
 });

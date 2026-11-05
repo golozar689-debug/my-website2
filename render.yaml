@@ -11,3 +11,7 @@ services:
         value: 24.22.1
       - key: NODE_ENV
         value: production
+      - key: ADMIN_EMAIL
+        value: golozarbehnood@gmail.com
+      - key: ADMIN_PASSWORD
+        generateValue: true
